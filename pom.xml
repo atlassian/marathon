@@ -30,14 +30,14 @@
 
     <distributionManagement>
         <repository>
-            <id>aws-release</id>
-            <name>Mesosphere Release Repository</name>
-            <url>s3://downloads.mesosphere.io/maven</url>
+            <id>atlassian-public</id>
+            <name>Atlassian Public Respoitory</name>
+            <url>https://maven.atlassian.com/content/repositories/atlassian-public/</url>
         </repository>
         <snapshotRepository>
-            <id>aws-snapshot</id>
-            <name>Mesosphere Snapshot Repository</name>
-            <url>s3://downloads.mesosphere.io/maven</url>
+            <id>atlassian-public-snapshot</id>
+            <name>Atlassian Public Snapshot Respoitory</name>
+            <url>https://maven.atlassian.com/content/repositories/atlassian-public-snapshot/</url>
         </snapshotRepository>
     </distributionManagement>
 
