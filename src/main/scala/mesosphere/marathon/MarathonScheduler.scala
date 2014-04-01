@@ -9,7 +9,7 @@ import scala.collection.mutable.HashSet
 import mesosphere.mesos.TaskBuilder
 import mesosphere.marathon.api.v1.AppDefinition
 import mesosphere.marathon.api.v2.AppUpdate
-import mesosphere.marathon.state.MarathonStore
+import mesosphere.marathon.state.{MarathonStore, AppRepository}
 import scala.util.{Failure, Success}
 import scala.concurrent.{Future, ExecutionContext}
 import com.google.common.collect.Lists
@@ -29,7 +29,7 @@ import mesosphere.util.RateLimiters
 class MarathonScheduler @Inject()(
     @Named(EventModule.busName) eventBus: Option[EventBus],
     @Named("restMapper") mapper: ObjectMapper,
-    store: MarathonStore[AppDefinition],
+    appRepository: AppRepository,
     taskTracker: TaskTracker,
     taskQueue: TaskQueue,
     frameworkIdUtil: FrameworkIdUtil,
@@ -40,6 +40,14 @@ class MarathonScheduler @Inject()(
 
   // TODO use a thread pool here
   import ExecutionContext.Implicits.global
+
+  /**
+   * Returns a future containing the optional most recent version
+   * of the specified app from persistent storage.
+   */
+  protected[marathon] def currentAppVersion(
+    appId: String
+  ): Future[Option[AppDefinition]] = appRepository.currentVersion(appId)
 
   def registered(driver: SchedulerDriver, frameworkId: FrameworkID, master: MasterInfo) {
     log.info("Registered as %s to master '%s'".format(frameworkId.getValue, master.getId))
@@ -78,7 +86,7 @@ class MarathonScheduler @Inject()(
                 task.getTaskId.getValue, offer.getHostname, ports,
                 offer.getAttributesList.asScala.toList)
               taskTracker.starting(app.id, marathonTask)
-              driver.launchTasks(offer.getId, taskInfos)
+              driver.launchTasks(Lists.newArrayList(offer.getId), taskInfos)
             }
             case None => {
               log.fine("Offer doesn't match request. Declining.")
@@ -181,12 +189,11 @@ class MarathonScheduler @Inject()(
   // TODO move stuff below out of the scheduler
 
   def startApp(driver: SchedulerDriver, app: AppDefinition): Future[_] = {
-    store.fetch(app.id).flatMap { appOption =>
+    currentAppVersion(app.id).flatMap { appOption =>
       require(appOption.isEmpty, s"Already started app '${app.id}'")
 
-      store.store(app.id, app).map { _ =>
+      appRepository.store(app).map { _ =>
         log.info(s"Starting app ${app.id}")
-        taskTracker.startUp(app.id)
         rateLimiters.setPermits(app.id, app.taskRateLimit)
         scale(driver, app)
       }
@@ -194,9 +201,9 @@ class MarathonScheduler @Inject()(
   }
 
   def stopApp(driver: SchedulerDriver, app: AppDefinition): Future[_] = {
-    store.expunge(app.id).map { success =>
-      if (!success) {
-        throw new UnknownAppException(app.id)
+    appRepository.expunge(app.id).map { successes =>
+      if (!successes.forall(_ == true)) {
+        throw new StorageException("Error expunging " + app.id )
       }
 
       log.info(s"Stopping app ${app.id}")
@@ -212,35 +219,22 @@ class MarathonScheduler @Inject()(
     }
   }
 
-  def updateApp(driver: SchedulerDriver,
-                id: String,
-                appUpdate: AppUpdate): Future[_] = {
-    store.fetch(id).flatMap {
-      case Some(storedApp) => {
-        val updatedApp = appUpdate.apply(storedApp)
-        store.store(updatedApp.id, updatedApp).map { _ =>
-          scale(driver, updatedApp)
+  def updateApp(
+    driver: SchedulerDriver,
+    id: String,
+    appUpdate: AppUpdate
+  ): Future[AppDefinition] = {
+    appRepository.currentVersion(id).flatMap {
+      case Some(currentVersion) => {
+        val updatedApp = appUpdate(currentVersion)
+        
+        appRepository.store(updatedApp).map { _ =>
           update(driver, updatedApp, appUpdate)
+          updatedApp
         }
       }
-      case None => throw new UnknownAppException(id)
-    }
-  }
 
-  @deprecated("The scale operation has been subsumed by update in the v2 API.", "0.4.0")
-  def scaleApp(driver: SchedulerDriver,
-               app: AppDefinition,
-               applyNow: Boolean): Future[_] = {
-    store.fetch(app.id).flatMap {
-      case Some(storedApp) => {
-        storedApp.instances = app.instances
-        store.store(app.id, storedApp).map { _ =>
-          if (applyNow) {
-            scale(driver, storedApp)
-          }
-        }
-      }
-      case None => throw new UnknownAppException(app.id)
+      case _ => throw new UnknownAppException(id)
     }
   }
 
@@ -252,7 +246,7 @@ class MarathonScheduler @Inject()(
    * @param driver scheduler driver
    */
   def reconcileTasks(driver: SchedulerDriver) {
-    store.names().onComplete {
+    appRepository.appIds().onComplete {
       case Success(iterator) => {
         log.info("Syncing tasks for all apps")
         val buf = new ListBuffer[TaskStatus]
@@ -313,7 +307,7 @@ class MarathonScheduler @Inject()(
    * @param driver
    * @param app
    */
-  private def scale(driver: SchedulerDriver, app: AppDefinition) {
+  def scale(driver: SchedulerDriver, app: AppDefinition) {
     taskTracker.get(app.id).synchronized {
       val currentCount = taskTracker.count(app.id)
       val targetCount = app.instances
@@ -348,9 +342,9 @@ class MarathonScheduler @Inject()(
   }
 
   private def scale(driver: SchedulerDriver, appName: String) {
-    store.fetch(appName).onSuccess {
+    currentAppVersion(appName).onSuccess {
       case Some(app) => scale(driver, app)
-      case None => log.warning("App %s does not exist. Not scaling.".format(appName))
+      case _ => log.warning("App %s does not exist. Not scaling.".format(appName))
     }
   }
 

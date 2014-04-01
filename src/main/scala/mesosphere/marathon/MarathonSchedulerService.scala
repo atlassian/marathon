@@ -5,7 +5,7 @@ import org.apache.mesos.MesosSchedulerDriver
 import java.util.logging.Logger
 import mesosphere.marathon.api.v1.AppDefinition
 import mesosphere.marathon.api.v2.AppUpdate
-import mesosphere.marathon.state.MarathonStore
+import mesosphere.marathon.state.{MarathonStore, AppRepository, Timestamp}
 import com.google.common.util.concurrent.AbstractExecutionThreadService
 import javax.inject.{Named, Inject}
 import java.util.{TimerTask, Timer}
@@ -30,7 +30,7 @@ class MarathonSchedulerService @Inject()(
     @Named(ModuleNames.NAMED_CANDIDATE) candidate: Option[Candidate],
     config: MarathonConf,
     @Named(ModuleNames.NAMED_LEADER_ATOMIC_BOOLEAN) leader: AtomicBoolean,
-    store: MarathonStore[AppDefinition],
+    appRepository: AppRepository,
     frameworkIdUtil: FrameworkIdUtil,
     scheduler: MarathonScheduler)
   extends AbstractExecutionThreadService with Leader {
@@ -55,7 +55,7 @@ class MarathonSchedulerService @Inject()(
   val frameworkInfo = FrameworkInfo.newBuilder()
     .setName(frameworkName)
     .setFailoverTimeout(config.mesosFailoverTimeout())
-    .setUser("") // Let Mesos assign the user
+    .setUser(config.mesosUser())
     .setCheckpoint(config.checkpoint())
 
 
@@ -72,12 +72,16 @@ class MarathonSchedulerService @Inject()(
   // Set the role, if provided.
   config.mesosRole.get.map(frameworkInfo.setRole)
 
-  val driver = new MesosSchedulerDriver(scheduler, frameworkInfo.build, config.mesosMaster())
+  val driver = new MesosSchedulerDriver(
+    scheduler,
+    frameworkInfo.build,
+    config.mesosMaster()
+  )
 
   var abdicateCmd: Option[ExceptionalCommand[JoinException]] = None
 
   def defaultWait = {
-    store.defaultWait
+    appRepository.defaultWait
   }
 
   def startApp(app: AppDefinition): Future[_] = {
@@ -88,54 +92,52 @@ class MarathonSchedulerService @Inject()(
     if (oldPorts != newPorts) {
       val asMsg = Seq(oldPorts, newPorts).map("[" + _.mkString(", ") + "]")
       log.info(s"Assigned some ports for ${app.id}: ${asMsg.mkString(" -> ")}")
-      app.ports = newPorts
     }
 
-    scheduler.startApp(driver, app)
+    scheduler.startApp(driver, app.copy(ports = newPorts))
   }
 
   def stopApp(app: AppDefinition): Future[_] = {
     scheduler.stopApp(driver, app)
   }
 
-  def updateApp(id: String, appUpdate: AppUpdate): Future[_] = {
-    scheduler.updateApp(driver, id, appUpdate)
-  }
+  def updateApp(appName: String, appUpdate: AppUpdate): Future[_] =
+    scheduler.updateApp(driver, appName, appUpdate).map { updatedApp =>
+      scheduler.scale(driver, updatedApp)
+    }
 
-  @deprecated("The scale operation has been subsumed by update in the v2 API.", "0.4.0")
-  def scaleApp(app: AppDefinition, applyNow: Boolean = true): Future[_] = {
-    scheduler.scaleApp(driver, app, applyNow)
-  }
+  def listApps(): Iterable[AppDefinition] = 
+    Await.result(appRepository.apps, defaultWait)
 
-  def listApps(): Seq[AppDefinition] = {
-    // TODO method is expensive, it's n+1 trips to ZK. Cache this?
-    val names = Await.result(store.names(), defaultWait)
-    val futures = names.map(name => store.fetch(name))
-    val futureServices = Future.sequence(futures)
-    Await.result(futureServices, defaultWait).map(_.get).toSeq
-  }
+  def listAppVersions(appName: String): Iterable[Timestamp] =
+    Await.result(appRepository.listVersions(appName), defaultWait)
 
   def getApp(appName: String): Option[AppDefinition] = {
-    val future = store.fetch(appName)
-    Await.result(future, defaultWait)
+    Await.result(appRepository.currentVersion(appName), defaultWait)
   }
 
-  def killTasks(appName: String, tasks: Iterable[MarathonTask], scale: Boolean): Iterable[MarathonTask] = {
+  def getApp(appName: String, version: Timestamp) : Option[AppDefinition] = {
+    Await.result(appRepository.app(appName, version), defaultWait)
+  }
+  
+  def killTasks(
+    appName: String,
+    tasks: Iterable[MarathonTask],
+    scale: Boolean
+  ): Iterable[MarathonTask] = {
     if (scale) {
-      getApp(appName) match {
-        case Some(appDef) =>
-          appDef.instances = appDef.instances - tasks.size
-
-          Await.result(scaleApp(appDef, false), defaultWait)
-        case None =>
+      getApp(appName) foreach { app =>
+        val appUpdate = AppUpdate(instances = Some(app.instances - tasks.size))
+        Await.result(scheduler.updateApp(driver, appName, appUpdate), defaultWait)
       }
     }
 
-    tasks.map(task => {
+    tasks.foreach { task =>
       log.info(f"Killing task ${task.getId} on host ${task.getHost}")
       driver.killTask(TaskID.newBuilder.setValue(task.getId).build)
-      task
-    })
+    }
+
+    tasks
   }
 
   //Begin Service interface
@@ -215,7 +217,7 @@ class MarathonSchedulerService @Inject()(
 
   private def newAppPort(app: AppDefinition): Int = {
     // TODO this is pretty expensive, find a better way
-    val assignedPorts = listApps().map(_.ports).flatten
+    val assignedPorts = listApps().map(_.ports).flatten.toSeq
     var port = 0
     do {
       port = config.localPortMin() + Random.nextInt(config.localPortMax() - config.localPortMin())

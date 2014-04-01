@@ -5,6 +5,7 @@ import org.junit.Assert._
 import com.google.common.collect.Lists
 import scala.collection.JavaConverters._
 import mesosphere.marathon.Protos.ServiceDefinition
+import mesosphere.marathon.state.Timestamp
 import org.apache.mesos.Protos.CommandInfo
 import javax.validation.Validation
 
@@ -15,14 +16,15 @@ class AppDefinitionTest {
 
   @Test
   def testToProto() {
-    val app = new AppDefinition
-    app.id = "play"
-    app.cmd = "bash foo-*/start -Dhttp.port=$PORT"
-    app.cpus = 4
-    app.mem = 256
-    app.instances = 5
-    app.ports = Seq(8080, 8081)
-    app.executor = "//cmd"
+    val app = AppDefinition(
+      id = "play",
+      cmd = "bash foo-*/start -Dhttp.port=$PORT",
+      cpus = 4,
+      mem = 256,
+      instances = 5,
+      ports = Seq(8080, 8081),
+      executor = "//cmd"
+    )
 
     val proto = app.toProto
     assertEquals("play", proto.getId)
@@ -39,45 +41,89 @@ class AppDefinitionTest {
   def testMergeFromProto() {
     val cmd = CommandInfo.newBuilder
       .setValue("bash foo-*/start -Dhttp.port=$PORT")
+
     val proto = ServiceDefinition.newBuilder
       .setId("play")
       .setCmd(cmd)
       .setInstances(3)
       .setExecutor("//cmd")
+      .setVersion(Timestamp.now.toString)
       .build
 
-    val app = new AppDefinition
-    app.mergeFromProto(proto)
+    val mergeResult = AppDefinition().mergeFromProto(proto)
 
-    assertEquals("play", app.id)
-    assertEquals(3, app.instances)
-    assertEquals("//cmd", app.executor)
-    assertEquals("bash foo-*/start -Dhttp.port=$PORT", app.cmd)
+    assertEquals("play", mergeResult.id)
+    assertEquals(3, mergeResult.instances)
+    assertEquals("//cmd", mergeResult.executor)
+    assertEquals("bash foo-*/start -Dhttp.port=$PORT", mergeResult.cmd)
   }
 
   @Test
   def testValidation() {
     val validator = Validation.buildDefaultValidatorFactory().getValidator
 
-    def shouldViolate(app: AppDefinition, path: String, template: String) {
+    def should(assertion: (Boolean) => Unit, app: AppDefinition, path: String, template: String) = {
       val violations = validator.validate(app).asScala
-      assertTrue(violations.exists(v =>
+      assertion(violations.exists(v =>
         v.getPropertyPath.toString == path && v.getMessageTemplate == template))
     }
 
-    def shouldNotViolate(app: AppDefinition, path: String, template: String) {
-      val violations = validator.validate(app).asScala
-      assertFalse(violations.exists(v =>
-        v.getPropertyPath.toString == path && v.getMessageTemplate == template))
-    }
+    def shouldViolate(app: AppDefinition, path: String, template: String) =
+      should(assertTrue, app, path, template)
 
-    val app = new AppDefinition
-    app.id = "a b"
+    def shouldNotViolate(app: AppDefinition, path: String, template: String) =
+      should(assertFalse, app, path, template)
+
+    val app = AppDefinition(id = "a b")
     shouldViolate(app, "id", "{javax.validation.constraints.Pattern.message}")
-    app.id = "a#$%^&*b"
-    shouldViolate(app, "id", "{javax.validation.constraints.Pattern.message}")
-    app.id = "ab"
-    shouldNotViolate(app, "id", "{javax.validation.constraints.Pattern.message}")
+
+    shouldViolate(
+      app.copy(id = "a#$%^&*b"),
+      "id",
+      "{javax.validation.constraints.Pattern.message}"
+    )
+
+    shouldNotViolate(
+      app.copy(id = "ab"),
+      "id",
+      "{javax.validation.constraints.Pattern.message}"
+    )
+
+    shouldViolate(
+      AppDefinition(id = "test", instances = -3),
+      "instances",
+      "{javax.validation.constraints.Min.message}"
+    )
+
+    shouldViolate(
+      AppDefinition(id = "test", instances = -3, ports = Seq(9000, 8080, 9000)),
+      "ports",
+      "Elements must be unique"
+    )
+
+    shouldNotViolate(
+      AppDefinition(id = "test", ports = Seq(0, 0, 8080)),
+      "ports",
+      "Elements must be unique"
+    )
+
+  }
+
+  @Test
+  def testSerializationRoundtrip() {
+    import com.fasterxml.jackson.databind.ObjectMapper
+    import com.fasterxml.jackson.module.scala.DefaultScalaModule
+    import mesosphere.marathon.api.v2.json.MarathonModule
+
+    val mapper = new ObjectMapper
+    mapper.registerModule(DefaultScalaModule)
+    mapper.registerModule(new MarathonModule)
+
+    val original = AppDefinition()
+    val json = mapper.writeValueAsString(original)
+    val readResult = mapper.readValue(json, classOf[AppDefinition])
+
+    assertTrue(readResult == original)
   }
 
   def getScalarResourceValue(proto: ServiceDefinition, name: String) = {

@@ -11,13 +11,22 @@ import "mesos.proto";
 message Constraint {
   required string field = 1;
   enum Operator {
+      // Field must be unique across all tasks.
       UNIQUE = 0;
+      // Field must match the regex given by value.
       LIKE = 1;
+      // Tasks will be clustered, i.e. all tasks need to have the same value. If value is not set, any value will be
+      // accepted for the first task, and subsequent tasks must use that same value.
       CLUSTER = 2;
+      // Tasks will be grouped by field. Value specifies the minimum size of each group.
       GROUP_BY = 3;
   }
   required Operator operator = 2;
   optional string value = 3;
+}
+
+message AppRepository {
+  repeated ServiceDefinition history = 1;
 }
 
 message ServiceDefinition {
@@ -31,6 +40,7 @@ message ServiceDefinition {
   required string executor = 8 [default = ""];
   optional double taskRateLimit = 9 [default = 1];
   optional ContainerInfo container = 10;
+  required string version = 11;
 }
 
 message MarathonTask {
@@ -52,3 +62,8 @@ message ContainerInfo {
   required bytes image = 1 [default = ""];
   repeated bytes options = 2;
 }
+
+message EventSubscribers {
+  repeated string callback_urls = 1;
+}
+

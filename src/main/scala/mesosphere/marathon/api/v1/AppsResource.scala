@@ -1,20 +1,19 @@
 package mesosphere.marathon.api.v1
 
-import scala.collection.JavaConverters._
-import javax.ws.rs._
 import mesosphere.marathon.MarathonSchedulerService
+import mesosphere.marathon.tasks.TaskTracker
+import mesosphere.marathon.api.v2.AppUpdate
+import mesosphere.marathon.event.{EventModule, ApiPostEvent}
+import javax.ws.rs._
 import javax.ws.rs.core.{Context, Response, MediaType}
 import javax.inject.{Named, Inject}
 import javax.validation.Valid
+import javax.servlet.http.HttpServletRequest
 import com.codahale.metrics.annotation.Timed
 import com.google.common.eventbus.EventBus
-import mesosphere.marathon.event.{EventModule, ApiPostEvent}
-import javax.servlet.http.HttpServletRequest
-import mesosphere.marathon.tasks.TaskTracker
 import scala.concurrent.Await
-import scala.concurrent.duration.Duration
 import java.util.logging.Logger
-import org.apache.mesos.Protos.TaskID
+import mesosphere.marathon.api.Responses
 
 /**
  * @author Tobi Knaup
@@ -30,9 +29,7 @@ class AppsResource @Inject()(
 
   @GET
   @Timed
-  def index = {
-    service.listApps
-  }
+  def index = service.listApps.map { _.withTaskCounts(taskTracker) }
 
   @POST
   @Path("start")
@@ -55,9 +52,10 @@ class AppsResource @Inject()(
   @POST
   @Path("scale")
   @Timed
-  def scale(@Context req: HttpServletRequest, app: AppDefinition): Response = {
+  def scale(@Context req: HttpServletRequest, @Valid app: AppDefinition): Response = {
     maybePostEvent(req, app)
-    Await.result(service.scaleApp(app), service.defaultWait)
+    val appUpdate = AppUpdate(instances = Some(app.instances))
+    Await.result(service.updateApp(app.id, appUpdate), service.defaultWait)
     Response.noContent.build
   }
 
@@ -99,7 +97,7 @@ class AppsResource @Inject()(
       val result = Map(appId -> tasks.map(s => s: Map[String, Object]))
       Response.ok(result).build
     } else {
-      Response.noContent.status(404).build
+      Responses.unknownApp(appId)
     }
   }
 

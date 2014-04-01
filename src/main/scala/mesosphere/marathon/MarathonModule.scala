@@ -12,7 +12,7 @@ import scala.collection.JavaConverters._
 import com.twitter.common.quantity.{Time, Amount}
 import java.util.concurrent.atomic.AtomicBoolean
 import com.google.inject.name.Names
-import mesosphere.marathon.state.MarathonStore
+import mesosphere.marathon.state.{MarathonStore, AppRepository}
 import mesosphere.marathon.api.v1.AppDefinition
 import mesosphere.marathon.tasks.TaskTracker
 import mesosphere.mesos.util.FrameworkIdUtil
@@ -84,7 +84,6 @@ class MarathonModule(conf: MarathonConf with ZookeeperConf)
     None
   }
 
-
   @Provides
   @Singleton
   def provideZookeeperClient(): ZooKeeperClient = {
@@ -98,9 +97,9 @@ class MarathonModule(conf: MarathonConf with ZookeeperConf)
 
   @Provides
   @Singleton
-  def provideMarathonStore(state: State): MarathonStore[AppDefinition] = {
-    new MarathonStore[AppDefinition](state, () => new AppDefinition)
-  }
+  def provideAppRepository(state: State): AppRepository = new AppRepository(
+    new MarathonStore[AppDefinition](state, () => AppDefinition.apply())
+  )
 
   @Provides
   @Singleton
